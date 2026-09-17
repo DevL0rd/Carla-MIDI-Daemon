@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Linux-Carla-MIDI-Daemon
-# Auto-wires MIDI controllers AND audio outputs for Carla plugins ("samplers")
-# on Linux/PipeWire, with per-plugin MIDI priority/failover and toggleable audio
-# routes. Optionally mixes plugin audio into your microphone WITHOUT a virtual
-# device: while a gating Carla plugin is loaded, it links the plugin's output
-# into whatever app is capturing the current default source. The default mic is
-# never changed and no device appears/disappears, so apps that own the default
-# (e.g. WiVRn) are left untouched.
+# Auto-wires MIDI controllers and audio for Carla plugins ("samplers") on
+# Linux/PipeWire, with per-plugin MIDI priority/failover.
 #
-# Event-driven via PipeWire's pw-mon (no polling). Requires: pw-link, pw-mon, jq.
-# Mic-mix feature additionally needs: pactl (to read the default source).
+# Audio always follows the system defaults — no per-device config:
+#   * each sampler's outputs are routed to the current DEFAULT SINK (your
+#     speakers/headphones), and
+#   * mixed into whatever is capturing the current DEFAULT SOURCE (your mic),
+#     so callers/recorders hear mic + Carla WITHOUT a virtual device. The
+#     default mic/output are never changed and nothing appears/disappears.
+# Switch your default input or output and the daemon re-routes live.
+#
+# Event-driven: reacts to PipeWire graph changes (pw-mon) and default in/out
+# changes (pactl subscribe). No polling. Requires: pw-link, pw-mon, jq, pactl.
 
 set -uo pipefail
 
@@ -20,6 +23,8 @@ log() { printf '%s carla-midi-daemon: %s\n' "$(date '+%H:%M:%S')" "$*"; }
 for c in pw-link pw-mon jq; do
   command -v "$c" >/dev/null || { log "required command not found: $c"; exit 1; }
 done
+HAVE_PACTL=0
+command -v pactl >/dev/null && HAVE_PACTL=1 || log "pactl not found (pipewire-pulse) — audio routing disabled, MIDI only"
 [ -r "$CONFIG" ] || { log "config not readable: $CONFIG"; exit 1; }
 jq -e . "$CONFIG" >/dev/null 2>&1 || { log "config is not valid JSON: $CONFIG"; exit 1; }
 
@@ -38,78 +43,112 @@ _ports() {
 src_exact()  { _ports o | awk -F'\t' -v n="$1" '$2==n      { print $1; exit }'; }   # exact source
 src_sub()    { _ports o | awk -F'\t' -v n="$1" 'index($2,n){ print $1; exit }'; }   # substring source
 sink_exact() { _ports i | awk -F'\t' -v n="$1" '$2==n      { print $1; exit }'; }   # exact sink
-# sink port whose node-name contains substring $1 and whose port is exactly $2
-sink_match() { _ports i | awk -F'\t' -v t="$1" -v p="$2" 'index($2,t) && $2 ~ ("[:]" p "$") { print $1; exit }'; }
-# true (exit 0) if any port belongs to a node named exactly $1
-node_exists() { { _ports o; _ports i; } | awk -F'\t' -v n="$1:" 'index($2,n)==1 { f=1 } END { exit f?0:1 }'; }
 
 mklink() { [ -n "${1:-}" ] && [ -n "${2:-}" ] && pw-link    "$1" "$2" 2>/dev/null; return 0; }
 rmlink() { [ -n "${1:-}" ] && [ -n "${2:-}" ] && pw-link -d "$1" "$2" 2>/dev/null; return 0; }
 
-# ── mic mix: feed Carla audio into the current default mic's consumers ──────
-# No virtual device and no default change. While the gating plugin is loaded we
-# link each sampler's stereo output INTO whatever apps are currently capturing
-# the default source, so those apps hear mic + Carla. Reconciled to the desired
-# set every pass: links to consumers that went away (or that belonged to a
-# previous default after it changes), and all links once the plugin closes, are
-# torn down; new consumers are wired up. Idempotent — safe to call each tick.
-mix_into_default_mic() {
-  [ "$(cfg '.mic_mix.enabled // false')" = true ] || return 0
-  command -v pactl >/dev/null || { log "mic_mix needs pactl (pipewire-pulse) — skipping"; return 0; }
+# ── default-based audio ─────────────────────────────────────────────────────
+# IDs and names of a plugin's output ports, sorted by name
+# (output_1, output_2, ...). Links must use IDs because applications such as
+# Chromium can expose several ports with the exact same name.
+plugin_outs() { _ports o | awk -F'\t' -v n="$1:" 'index($2,n)==1' | sort -t $'\t' -k2,2; }
 
-  local -a samplers
-  mapfile -t samplers < <(cfg '.mic_mix.mix_samplers[]?')
-  [ "${#samplers[@]}" -eq 0 ] && return 0
+# Input ports currently fed by node $1's capture ports (i.e. who reads a source).
+source_consumers() {
+  pw-link -I -o -l 2>/dev/null | awk -v def="$1:" '
+    /\|->/ {
+      if (cur) {
+        l=$0; sub(/^.*\|->[[:space:]]*/, "", l)
+        id=l; sub(/[[:space:]].*$/, "", id)
+        name=l; sub(/^[0-9]+[[:space:]]+/, "", name)
+        sub(/ \((capture|playback)\)$/, "", name)
+        print id "\t" name
+      }
+      next
+    }
+    {
+      name=$0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", name)
+      sub(/ \((capture|playback)\)$/, "", name)
+      cur = (index(name, def) == 1)
+    }
+  '
+}
 
-  local gate gate_present
-  gate=$(cfg '.mic_mix.present_with // ""')
-  if [ -n "$gate" ]; then node_exists "$gate"; gate_present=$?; else gate_present=0; fi
+# Desired "OUTPORT<TAB>INPORT" audio links for one plugin: its outputs go to the
+# default sink's playback ports AND into every consumer of the default source.
+desired_audio_links() {
+  [ "$HAVE_PACTL" = 1 ] || return 0
+  local plugin="$1" L R sink src port port_id cport cport_id
+  local -a outs; mapfile -t outs < <(plugin_outs "$plugin")
+  [ "${#outs[@]}" -eq 0 ] && return 0
+  L="${outs[0]%%$'\t'*}"
+  R="${outs[1]:-${outs[0]}}"; R="${R%%$'\t'*}"   # left, right (mono duplicates)
 
-  # ── desired links: "sampler_out<TAB>consumer_in" (empty while plugin closed) ─
-  local desired="" def consumers cport s
-  if [ "$gate_present" -eq 0 ]; then
-    def=$(pactl get-default-source 2>/dev/null)
-    if [ -n "$def" ] && [ "$def" != "@DEFAULT_SOURCE@" ]; then
-      # input ports currently fed by the default source's capture ports
-      consumers=$(pw-link -o -l 2>/dev/null | awk -v def="$def:" '
-        /^[[:space:]]*\|->/ { if (cur) { l=$0; sub(/^[[:space:]]*\|-> /,"",l); sub(/ \((capture|playback)\)$/,"",l); print l } ; next }
-        /^[[:space:]]/      { next }
-        { cur = (index($0, def) == 1) }
-      ')
-      while IFS= read -r cport; do
-        [ -z "$cport" ] && continue
-        for s in "${samplers[@]}"; do
-          [ -z "$s" ] && continue
-          case "$cport" in
-            *FR|*_R|*-R|*[Rr]ight*) desired+="$s:output_2	$cport"$'\n' ;;
-            *FL|*_L|*-L|*[Ll]eft*)  desired+="$s:output_1	$cport"$'\n' ;;
-            *) desired+="$s:output_1	$cport"$'\n'"$s:output_2	$cport"$'\n' ;;  # mono/unknown -> sum both
-          esac
-        done
-      done <<< "$consumers"
-    fi
+  # 1) default output (speakers / headphones)
+  sink=$(pactl get-default-sink 2>/dev/null)
+  if [ -n "$sink" ] && [ "$sink" != "@DEFAULT_SINK@" ]; then
+    while IFS=$'\t' read -r port_id port; do
+      case "$port" in
+        *FR|*_R|*-R) printf '%s\t%s\n' "$R" "$port_id" ;;
+        *FL|*_L|*-L) printf '%s\t%s\n' "$L" "$port_id" ;;
+      esac
+    done < <(_ports i | awk -F'\t' -v n="$sink:" 'index($2,n)==1')
   fi
 
-  # ── existing links from our sampler outputs: "sampler_out<TAB>consumer_in" ──
-  local existing="" cur="" line dst port
-  while IFS= read -r line; do
-    case "$line" in
-      *"|-> "*) [ -n "$cur" ] && { dst=${line##*|-> }; dst=${dst% (capture)}; dst=${dst% (playback)}; existing+="$cur	$dst"$'\n'; } ;;
-      [[:space:]]*) : ;;                                    # other indented (e.g. |<-) lines
-      *) port=${line% (capture)}; port=${port% (playback)}; cur=""
-         for s in "${samplers[@]}"; do case "$port" in "$s:output_1"|"$s:output_2") cur="$port" ;; esac; done ;;
-    esac
-  done < <(pw-link -o -l 2>/dev/null)
+  # 2) default input's consumers (mic mix — no virtual device)
+  src=$(pactl get-default-source 2>/dev/null)
+  if [ -n "$src" ] && [ "$src" != "@DEFAULT_SOURCE@" ]; then
+    while IFS=$'\t' read -r cport_id cport; do
+      [ -z "$cport_id" ] && continue
+      case "$cport" in
+        "$plugin:"*) continue ;;                       # never feed ourselves
+        *FR|*_R|*-R|*[Rr]ight*) printf '%s\t%s\n' "$R" "$cport_id" ;;
+        *FL|*_L|*-L|*[Ll]eft*)  printf '%s\t%s\n' "$L" "$cport_id" ;;
+        *) printf '%s\t%s\n' "$L" "$cport_id"; printf '%s\t%s\n' "$R" "$cport_id" ;;  # mono/unknown -> sum
+      esac
+    done < <(source_consumers "$src")
+  fi
+}
 
-  # ── reconcile: drop stale, add missing ─────────────────────────────────────
-  local link
+# Existing "OUTPORT<TAB>INPORT" links currently coming from a plugin's outputs.
+existing_audio_links() {
+  local plugin="$1"
+  pw-link -I -o -l 2>/dev/null | awk -v plugin="$plugin:" '
+    /\|->/ {
+      if (cur) {
+        l=$0; sub(/^.*\|->[[:space:]]*/, "", l)
+        dst=l; sub(/[[:space:]].*$/, "", dst)
+        print cur "\t" dst
+      }
+      next
+    }
+    {
+      id=$1
+      name=$0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", name)
+      sub(/ \((capture|playback)\)$/, "", name)
+      if (index(name, plugin) == 1) cur=id; else cur=""
+    }
+  '
+}
+
+# Reconcile one plugin's output links to exactly the desired set (drop stale,
+# add missing). Speaker and mic-mix links are reconciled together, so they
+# never tear each other down.
+apply_audio() {
+  local plugin="$1" desired existing link a b
+  desired=$(desired_audio_links "$plugin")
+  existing=$(existing_audio_links "$plugin")
   while IFS= read -r link; do
     [ -z "$link" ] && continue
-    printf '%s' "$desired" | grep -qxF "$link" || rmlink "${link%%	*}" "${link##*	}"
+    printf '%s\n' "$desired" | grep -qxF -- "$link" && continue
+    IFS=$'\t' read -r a b <<< "$link"; rmlink "$a" "$b"
   done <<< "$existing"
   while IFS= read -r link; do
     [ -z "$link" ] && continue
-    printf '%s' "$existing" | grep -qxF "$link" || mklink "${link%%	*}" "${link##*	}"
+    printf '%s\n' "$existing" | grep -qxF -- "$link" && continue
+    IFS=$'\t' read -r a b <<< "$link"; mklink "$a" "$b"
   done <<< "$desired"
 }
 
@@ -177,61 +216,57 @@ reconcile() {
       fi
     fi
 
-    # ── AUDIO: route sampler outputs to each destination (toggleable) ─────
-    local -a sp dp
-    mapfile -t sp < <(cfg ".samplers[$i].audio.source_ports[]?")
-    [ "${#sp[@]}" -eq 0 ] && continue
-    local rn j enabled rtarget k soid doid
-    rn=$(cfg "(.samplers[$i].audio.routes // []) | length"); [ -z "$rn" ] && rn=0
-    for ((j = 0; j < rn; j++)); do
-      enabled=$(cfg ".samplers[$i].audio.routes[$j].enabled != false")   # default true; only explicit false disables
-      rtarget=$(cfg ".samplers[$i].audio.routes[$j].target")
-      [ -z "$rtarget" ] || [ "$rtarget" = null ] && continue
-      mapfile -t dp < <(cfg ".samplers[$i].audio.routes[$j].ports[]?")
-      for ((k = 0; k < ${#sp[@]} && k < ${#dp[@]}; k++)); do
-        soid=$(src_exact "$plugin:${sp[$k]}")
-        doid=$(sink_match "$rtarget" "${dp[$k]}")
-        if [ "$enabled" = true ]; then mklink "$soid" "$doid"   # connect enabled route
-        else rmlink "$soid" "$doid"; fi                          # disconnect disabled route
-      done
-    done
+    # ── AUDIO: default sink + default source consumers ───────────────────
+    apply_audio "$plugin"
   done
 
   auto_launch
-  mix_into_default_mic
 }
 
-# ── lifecycle: drop our mic-mix links when the daemon stops ─────────────────
+# ── lifecycle: drop the mic-mix links when the daemon stops ─────────────────
+# Speaker links are harmless to leave; the mic-mix links are removed so nothing
+# keeps hearing Carla after we exit.
 cleanup() {
-  [ "$(cfg '.mic_mix.enabled // false')" = true ] || return 0
-  local -a samplers; mapfile -t samplers < <(cfg '.mic_mix.mix_samplers[]?')
-  [ "${#samplers[@]}" -eq 0 ] && return 0
-  local cur="" line dst s
-  while IFS= read -r line; do
-    case "$line" in
-      *"|-> "*) [ -n "$cur" ] && { dst=${line##*|-> }; dst=${dst% (capture)}; dst=${dst% (playback)}; rmlink "$cur" "$dst"; } ;;
-      [[:space:]]*) : ;;
-      *) cur=""; line=${line% (capture)}; line=${line% (playback)}
-         for s in "${samplers[@]}"; do case "$line" in "$s:output_1"|"$s:output_2") cur="$line" ;; esac; done ;;
-    esac
-  done < <(pw-link -o -l 2>/dev/null)
+  [ "$HAVE_PACTL" = 1 ] || return 0
+  local n i plugin src cport_id L R
+  src=$(pactl get-default-source 2>/dev/null)
+  [ -z "$src" ] || [ "$src" = "@DEFAULT_SOURCE@" ] && return 0
+  n=$(cfg '(.samplers // []) | length'); [ -z "$n" ] && n=0
+  for ((i = 0; i < n; i++)); do
+    plugin=$(cfg ".samplers[$i].plugin")
+    [ -z "$plugin" ] || [ "$plugin" = null ] && continue
+    local -a outs; mapfile -t outs < <(plugin_outs "$plugin")
+    [ "${#outs[@]}" -eq 0 ] && continue
+    L="${outs[0]%%$'\t'*}"
+    R="${outs[1]:-${outs[0]}}"; R="${R%%$'\t'*}"
+    while IFS=$'\t' read -r cport_id _; do
+      [ -z "$cport_id" ] && continue
+      rmlink "$L" "$cport_id"; rmlink "$R" "$cport_id"
+    done < <(source_consumers "$src")
+  done
 }
 trap cleanup EXIT INT TERM
 
-# ── run: initial pass, then react to graph changes (debounced) ─────────────
+# ── run: initial pass, then react to graph + default changes (debounced) ────
 # pw-mon emits thousands of param-update lines per second, and every pw-link the
 # daemon runs registers a short-lived Client — reacting to those would spin the
 # CPU and self-trigger forever. So in C (awk) we wake the shell ONLY when a
-# Node/Port/Device is added or removed (a real controller/plugin/mic appearing
-# or leaving), ignoring Client/Link churn and param updates. Bursts are
-# coalesced into one reconcile.
+# Node/Port/Device is added or removed. pactl subscribe adds wake-ups for
+# default input/output changes (a metadata change pw-mon doesn't surface).
+# Bursts are coalesced into one reconcile.
+watch_events() {
+  pw-mon 2>/dev/null | awk '
+    /^(added|removed):/                                  { hot = 1; next }
+    /^[a-z]+:/                                           { hot = 0 }
+    hot && /type: PipeWire:Interface:(Node|Port|Device)/ { print "graph"; fflush(); hot = 0 }
+  ' &
+  [ "$HAVE_PACTL" = 1 ] && { pactl subscribe 2>/dev/null | awk '/on server/ { print "default"; fflush() }' & }
+  wait
+}
+
 log "starting; config=$CONFIG"
 reconcile
-pw-mon 2>/dev/null | awk '
-  /^(added|removed):/                                  { hot = 1; next }
-  /^[a-z]+:/                                           { hot = 0 }
-  hot && /type: PipeWire:Interface:(Node|Port|Device)/ { print; fflush(); hot = 0 }
-' | while IFS= read -r _; do
+watch_events | while IFS= read -r _; do
   while IFS= read -r -t 0.4 _; do :; done
   reconcile
 done

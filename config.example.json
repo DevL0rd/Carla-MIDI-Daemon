@@ -1,5 +1,5 @@
 {
-  "_comment": "Linux-Carla-MIDI-Daemon config. Strict JSON (no comments in your real file). See README for the full schema. Find names with: 'pw-link -o' for MIDI sources, 'pw-link -i' for audio targets, 'pactl list short sources' for capture sources.",
+  "_comment": "Linux-Carla-MIDI-Daemon config. Strict JSON (no comments in your real file). Audio always follows the system default input/output — there is no audio config. See README for the full schema. Find MIDI names with: 'pw-link -o | grep -i midi'.",
   "samplers": [
     {
       "plugin": "BitsonicSampler",
@@ -11,27 +11,9 @@
           "USB func for MIDI",
           "CN29: Bluetooth"
         ]
-      },
-
-      "audio": {
-        "source_ports": ["output_1", "output_2"],
-        "routes": [
-          {
-            "name": "headphones",
-            "enabled": true,
-            "target": "ROG_DELTA_II",
-            "ports": ["playback_FL", "playback_FR"]
-          }
-        ]
       }
     }
   ],
-
-  "mic_mix": {
-    "enabled": true,
-    "present_with": "BitsonicSampler",
-    "mix_samplers": ["BitsonicSampler"]
-  },
 
   "auto_launch": {
     "enabled": true,

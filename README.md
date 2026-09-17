@@ -13,25 +13,31 @@ your rig "just works" no matter what gets plugged in or unplugged.
 - **MIDI priority/failover** — map several controllers to a Carla plugin (a
   *sampler*) in priority order. The highest-priority connected controller drives
   it; unplug it and it falls back to the next, plug it back and it switches back.
-- **Audio routing** — route each plugin's outputs to one or more destinations,
-  each with an `enabled` toggle.
-- **Mic mix (no virtual device)** — while a Carla plugin is loaded, mix its
-  audio into your microphone by linking the plugin output into whatever app is
-  capturing the **current default source**. The default mic is never changed and
-  no device appears/disappears, so apps that own the default (e.g. WiVRn) keep
-  working. Links are removed when the plugin closes or the daemon stops.
+- **Audio to the default output** — each plugin's outputs are routed to the
+  current **default sink** (your speakers/headphones). Change your default output
+  and it re-routes live. No per-device config.
+- **Mic mix (no virtual device)** — mix each plugin's audio into your microphone
+  by linking its output into whatever app is capturing the **current default
+  source**, so callers/recorders hear mic + Carla. The default mic is never
+  changed and no device appears/disappears, so apps that own the default (e.g.
+  WiVRn) keep working. Links are removed when the daemon stops.
+- **Follows the defaults** — nothing is hardcoded to a specific device (or to
+  EasyEffects). Switch your default input/output and the daemon re-wires. For the
+  mic mix to reach an app, point that app's input at **Default**.
 - **Auto-launch Carla** — open Carla automatically when a controller is plugged
   in.
 - **auto_add** (optional) — grab any connected MIDI device when none of the
   listed ones are present.
 - **Event-driven** — wakes only on real Node/Port/Device changes (filtered from
-  PipeWire's firehose in C); ~0% CPU at idle. No polling.
+  PipeWire's firehose in C) and default input/output changes (`pactl subscribe`);
+  ~0% CPU at idle. No polling.
 
 ## Requirements
 
 - PipeWire with `pw-link` and `pw-mon`
 - `jq`
-- `pactl` (only for the virtual-microphone feature; from `pipewire-pulse`)
+- `pactl` (for all audio routing; from `pipewire-pulse`). Without it the daemon
+  still does MIDI, but no audio wiring.
 - [Carla](https://github.com/falkTX/Carla)
 - A user systemd session (runs as a `--user` service)
 
@@ -62,20 +68,9 @@ All configuration is **JSON**, at `~/.config/carla-midi-daemon/config.json`:
         "port": "events-in",
         "auto_add": false,
         "priority": ["USB func for MIDI", "CN29: Bluetooth"]
-      },
-      "audio": {
-        "source_ports": ["output_1", "output_2"],
-        "routes": [
-          { "name": "headphones", "enabled": true, "target": "ROG_DELTA_II", "ports": ["playback_FL", "playback_FR"] }
-        ]
       }
     }
   ],
-  "mic_mix": {
-    "enabled": true,
-    "present_with": "BitsonicSampler",
-    "mix_samplers": ["BitsonicSampler"]
-  },
   "auto_launch": {
     "enabled": true,
     "command": "carla $HOME/.config/carla-midi-daemon/BitsonicSampler.carxp",
@@ -85,13 +80,15 @@ All configuration is **JSON**, at `~/.config/carla-midi-daemon/config.json`:
 }
 ```
 
-**Name matching:** MIDI devices and audio `target`s are matched as a **substring**
-of the PipeWire port/node name, so a recognizable fragment is enough. List names
-with:
+**Audio is not configured** — it always follows the system default input and
+output (see [Audio](#audio) below). You only configure MIDI and auto-launch.
+
+**Name matching:** MIDI devices are matched as a **substring** of the PipeWire
+port name, so a recognizable fragment is enough. List names with:
 
 ```bash
 pw-link -o | grep -i midi     # MIDI controllers
-pw-link -i                    # audio sinks / route targets
+pactl get-default-sink        # where Carla audio is sent
 pactl get-default-source      # the mic the mix follows
 ```
 
@@ -103,30 +100,29 @@ pactl get-default-source      # the mic the mix follows
 | `midi.port` | Plugin's MIDI input port. Default `events-in`. |
 | `midi.priority[]` | MIDI devices, ordered — first = highest priority. |
 | `midi.auto_add` | `true` to grab any MIDI device when none listed are present. |
-| `audio.source_ports[]` | Plugin output ports, e.g. `["output_1","output_2"]` (L, R). |
-| `audio.routes[]` | Destinations; connected when `enabled` (default true), disconnected when `false`. |
-| `route.target` / `route.ports[]` | Destination node (substring) and its input ports, paired with `source_ports` by position. |
 
-### `mic_mix`
+### Audio
 
-Mixes plugin audio into your microphone **without a virtual device**. While the
-gating plugin is loaded, the daemon links each sampler's stereo output into
-whatever apps are currently capturing the **default source** (`pactl
-get-default-source`), so those apps hear mic + Carla. The default mic is never
-changed and nothing appears/disappears, so apps that own the default (e.g.
-WiVRn) are unaffected. Links are reconciled each pass and removed when the
-plugin closes, the default changes, or the daemon stops.
+There is nothing to configure. For every `plugin` in `samplers[]`, the daemon
+takes its output ports (`output_1`/`output_2`) and, on every graph or default
+change:
 
-Because it follows the *default* source, a mono mic fans both Carla channels
-into a mono consumer; a stereo consumer gets L/R by position. An app capturing a
-specific non-default device only receives the mix if that device is downstream
-of the default (e.g. via EasyEffects pointed at the default mic).
+- routes them to the current **default sink** — your speakers/headphones; and
+- mixes them into every consumer of the current **default source** — so anything
+  capturing your mic hears mic + Carla, **without a virtual device**. The default
+  mic is never changed and nothing appears/disappears, so apps that own the
+  default (e.g. WiVRn) are unaffected.
 
-| Field | Meaning |
-|-------|---------|
-| `enabled` | Turn the feature on/off. |
-| `present_with` | Node whose presence gates the mix (your plugin) — its appearance/disappearance = Carla open/close. |
-| `mix_samplers[]` | Plugins whose stereo outputs (`output_1`/`output_2`) are mixed in. |
+A mono mic fans both Carla channels into the mono consumer; a stereo consumer
+gets L/R by position. Speaker and mic-mix links are reconciled together, so they
+never fight over the plugin's output ports. The mic-mix links are torn down when
+the daemon stops.
+
+Because it follows whatever is capturing the *default* source, it works with or
+without an effects processor (e.g. EasyEffects) in the chain — the daemon never
+references one. **For an app to receive the mix, set that app's input device to
+"Default"** (not pinned to a specific node). Switch your default mic or output at
+any time and the daemon re-routes live.
 
 ### `auto_launch`
 
