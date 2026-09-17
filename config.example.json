@@ -1,5 +1,5 @@
 {
-  "_comment": "Linux-Carla-MIDI-Daemon config. Strict JSON (no comments in your real file). Audio always follows the system default input/output — there is no audio config. See README for the full schema. Find MIDI names with: 'pw-link -o | grep -i midi'.",
+  "_comment": "Carla-MIDI-Daemon config. Strict JSON (no comments in your real file). Audio always follows the system default input/output — there is no audio config. See README for the full schema. Find MIDI names with: 'pw-link -o | grep -i midi'.",
   "samplers": [
     {
       "plugin": "BitsonicSampler",

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotent installer for Linux-Carla-MIDI-Daemon.
+# Idempotent installer for Carla-MIDI-Daemon.
 # Safe to re-run: it refreshes the binary/service and never clobbers your config.
 set -euo pipefail
 
@@ -12,7 +12,7 @@ PROJ="$CFG_DIR/BitsonicSampler.carxp"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="$UNIT_DIR/carla-midi-daemon.service"
 
-echo ">> Installing Linux-Carla-MIDI-Daemon"
+echo ">> Installing Carla-MIDI-Daemon"
 
 for c in pw-link pw-mon jq; do
   command -v "$c" >/dev/null || { echo "!! required command not found: $c (pw-link/pw-mon = pipewire, jq = jq)"; exit 1; }
