@@ -168,4 +168,4 @@ The daemon removes its mic-mix links on shutdown, so nothing is left dangling.
 
 ## License
 
-Released into the public domain — do whatever you like with it.
+Released into the public domain under [The Unlicense](LICENSE) — do whatever you like with it.
